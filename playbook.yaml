@@ -1,0 +1,77 @@
+- name: Install Required Packages
+  hosts: all
+  become: yes
+  
+  tasks: 
+   - name: Ensure tmux is installed
+     ansible.builtin.package:
+      name: tmux
+      state: present
+
+- name: Install Oh My Zsh
+  hosts: all
+  tasks:
+   - name: "Ensure curl is installed"
+     ansible.builtin.package:
+      name: curl
+      state: present
+     become: yes
+   - name: "Install Oh My Zsh"
+     ansible.builtin.shell: |
+      sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh) -s --unattended"
+     args:
+      chdir: "{{ ansible_env.HOME }}"
+      creates: "{{ ansible_env.HOME }}/.oh-my-zsh"
+     become: no
+     register: omz_install_status
+     changed_when: "'already installed' not in omz_install_status.stdout and omz_install_status.rc == 0"
+
+- name: Setup Dotfiles
+  hosts: all
+  become: no
+
+  vars:
+   dotfiles_repo_url: "https://github.com/dekaikiwi/dotfiles"
+
+  tasks:
+   - name: Ensure git is installed
+     ansible.builtin.package:
+      name: git
+      state: present
+   - name: Define dotfiles repo clone directory 
+     ansible.builtin.set_fact:
+       dotfiles_clone_dir_full_path: "{{ ansible_env.HOME }}/repos/dotfiles"
+       become: no
+   - name: Clone or update dotfiles repo
+     ansible.builtin.git:
+      repo: "{{ dotfiles_repo_url }}"
+      dest: "{{ dotfiles_clone_dir_full_path }}"
+      version: "master"
+      accept_hostkey: yes
+      force: yes
+     become: no
+     register: git_clone_status
+
+   - name: Find files in dotfiles repo to link
+     ansible.builtin.find:
+       paths: "{{ dotfiles_clone_dir_full_path }}"
+       recurse: no
+       file_type: file
+       hidden: yes
+       patterns:
+        - ".*"
+       excludes:
+        - .git
+     register: dotfiles_found
+     become: no
+
+   - name: Symlink dotfiles to HOME dir
+     ansible.builtin.file:
+      src: "{{ item.path }}"
+      dest: "{{ ansible_env.HOME }}/{{ item_relative_path }}"
+      state: link
+      force: yes
+     loop: "{{ dotfiles_found.files }}"
+     vars:
+      item_relative_path: "{{ item.path | replace(dotfiles_clone_dir_full_path + '/', '') }}"
+     become: no
