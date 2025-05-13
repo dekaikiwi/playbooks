@@ -10,6 +10,7 @@
 
 - name: Install Oh My Zsh
   hosts: all
+  gather_facts: yes
   tasks:
    - name: "Ensure curl is installed"
      ansible.builtin.package:
@@ -26,12 +27,32 @@
      register: omz_install_status
      changed_when: "'already installed' not in omz_install_status.stdout and omz_install_status.rc == 0"
 
+   - name: Get zsh path
+     ansible.builtin.command: "which zsh"
+     register: zsh_path_result
+     changed_when: false # This task does not change system state
+     check_mode: false # This task needs to run in check mode to get the path for subsequent tasks
+     become: no # 'which' command does not typically require sudo
+
+   - name: Fail if zsh executable is not found
+     ansible.builtin.fail:
+       msg: "zsh executable not found after attempting to install. Cannot set as default shell."
+     when: zsh_path_result.rc != 0 or zsh_path_result.stdout == "" or "/zsh" not in zsh_path_result.stdout
+
+   - name: "Set Zsh as default shell for {{ ansible_env.USER }}"
+     ansible.builtin.user:
+       name: "{{ ansible_env.USER }}" # The user Ansible is connected as (e.g., remote_user)
+       shell: "{{ zsh_path_result.stdout | trim }}" # Use the found path to zsh, trim whitespace
+     become: yes # Changing a user's shell requires root privileges
+     when: zsh_path_result.rc == 0 and zsh_path_result.stdout != "" # Only if zsh path is valid
+
 - name: Setup Dotfiles
   hosts: all
   become: no
 
   vars:
    dotfiles_repo_url: "https://github.com/dekaikiwi/dotfiles"
+   dotfiles_neovim_config_dir_name: "nvim-config"
 
   tasks:
    - name: Ensure git is installed
@@ -51,6 +72,28 @@
       force: yes
      become: no
      register: git_clone_status
+
+   - name: Ensure .config directory exists in HOME
+     ansible.builtin.file:
+       path: "{{ ansible_env.HOME }}/.config"
+       state: directory
+       mode: '0755' # Standard permissions for user directory
+     become: no # User can create directories in their HOME
+
+   - name: Check if Neovim config directory exists in cloned dotfiles
+     ansible.builtin.stat:
+       path: "{{ dotfiles_clone_dir_full_path }}/{{ dotfiles_neovim_config_dir_name }}"
+     register: nvim_config_in_dotfiles_stat
+     become: no # Stat operation as user
+
+   - name: Symlink Neovim config directory from dotfiles
+     ansible.builtin.file:
+       src: "{{ dotfiles_clone_dir_full_path }}/{{ dotfiles_neovim_config_dir_name }}"
+       dest: "{{ ansible_env.HOME }}/.config/nvim"
+       state: link
+       force: yes # Overwrite if it exists, consistent with other dotfiles
+     when: nvim_config_in_dotfiles_stat.stat.exists and nvim_config_in_dotfiles_stat.stat.isdir
+     become: no # Symlinking as user
 
    - name: Find files in dotfiles repo to link
      ansible.builtin.find:
@@ -75,3 +118,96 @@
      vars:
       item_relative_path: "{{ item.path | replace(dotfiles_clone_dir_full_path + '/', '') }}"
      become: no
+     
+     
+# New Play for Compiling and Installing Neovim
+- name: Compile and Install Neovim from Source
+  hosts: all
+  # No play-level 'become: yes', apply it only to tasks that need it.
+
+  vars:
+    neovim_repo_url: "https://github.com/neovim/neovim.git"
+    neovim_clone_dir: "{{ ansible_env.HOME }}/src/neovim" # Directory to clone neovim source
+    neovim_version_to_build: "stable" # Or "master", "nightly", or a specific tag like "v0.10.0"
+    neovim_build_type: "Release" # Standard build type for performance
+    neovim_binary_path: "/usr/local/bin/nvim" # Default installation path for nvim
+
+  tasks:
+    - name: Ensure Neovim build dependencies are installed
+      ansible.builtin.package:
+        name:
+          # Common dependencies for Debian/Ubuntu. Adjust for other OS families if needed.
+          # Based on https://github.com/neovim/neovim/wiki/Building-Neovim#build-prerequisites
+          - git
+          - ninja-build         # Recommended build system
+          - gettext             # For localization
+          - cmake               # Build configuration
+          - unzip
+          - curl
+          - build-essential     # Provides C/C++ compilers (gcc/g++) and make
+          # Other potentially useful packages for some systems or full features:
+          # - libtool
+          # - libtool-bin
+          # - autoconf
+          # - automake
+          # - pkg-config        # (Often pulled in by cmake or build-essential)
+          # - doxygen           # For documentation generation (optional)
+        state: present
+      become: yes # Package installation requires sudo
+
+    - name: Create source directory for Neovim clone if it doesn't exist
+      ansible.builtin.file:
+        path: "{{ ansible_env.HOME }}/src" # Parent directory for neovim_clone_dir
+        state: directory
+        mode: '0755' # Standard permissions for user directory
+      become: no # User can create directories in their HOME
+
+    - name: Clone or update Neovim repository
+      ansible.builtin.git:
+        repo: "{{ neovim_repo_url }}"
+        dest: "{{ neovim_clone_dir }}"
+        version: "{{ neovim_version_to_build }}"
+        depth: 1 # Optional: Use for faster clone if only the tip of the branch/tag is needed
+                 # Remove if you need full history or plan to switch between older tags often.
+      become: no # Cloning should be done as the user
+      register: neovim_git_clone
+
+    - name: Check if Neovim is already installed
+      ansible.builtin.stat:
+        path: "{{ neovim_binary_path }}"
+      register: nvim_binary_stat
+      become: no # stat does not require sudo
+
+    # Conditional tasks for building and installing Neovim.
+    # These will run if Neovim is not found at neovim_binary_path,
+    # OR if the git repository was updated (neovim_git_clone.changed is true).
+    - block:
+        - name: Clean previous Neovim build artifacts (if source changed)
+          ansible.builtin.command:
+            cmd: make distclean
+            chdir: "{{ neovim_clone_dir }}"
+          # Run only if the repo was updated and we are about to rebuild.
+          # This ensures a clean build environment.
+          when: neovim_git_clone.changed
+          failed_when: false # Don't fail if distclean fails (e.g., first time, nothing to clean)
+          changed_when: false # Cleaning doesn't modify the system state in Ansible's view
+          become: no # Cleaning build artifacts is done as the user
+
+        - name: Build Neovim
+          ansible.builtin.command:
+            # This is the standard command to configure (via CMake) and build Neovim.
+            cmd: "make CMAKE_BUILD_TYPE={{ neovim_build_type }}"
+            chdir: "{{ neovim_clone_dir }}"
+          become: no # Compilation should be done as the user
+          environment: # Explicitly set CMAKE_BUILD_TYPE in environment as well, belt and suspenders
+            CMAKE_BUILD_TYPE: "{{ neovim_build_type }}"
+
+        - name: Install Neovim
+          ansible.builtin.command: # Using command for consistency, make module also works
+            cmd: make install
+            chdir: "{{ neovim_clone_dir }}"
+            # 'creates' could be used here for simple idempotency if the 'when' condition wasn't also checking for source changes.
+            # creates: "{{ neovim_binary_path }}"
+          become: yes # Installation (typically to /usr/local) requires sudo
+
+      when: not nvim_binary_stat.stat.exists or neovim_git_clone.changed   
